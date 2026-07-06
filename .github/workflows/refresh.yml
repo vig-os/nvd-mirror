@@ -2,16 +2,19 @@
 # (served by GitHub Pages).
 #
 # vulnix (nix-community/vulnix) consumes the NVD 2.0 JSON data feeds, but
-# nvd.nist.gov is chronically throttled/unstable (vulnix#171): cold scans crawl
-# the full year-feed set for tens of minutes and fail with ReadTimeoutError /
-# IncompleteRead / intermittent 404s. This repo is a dedicated public mirror:
-# this workflow is the only thing that talks to nvd.nist.gov. It downloads the
-# feed files with resumable retry, validates them, and force-pushes them to the
-# gh-pages branch (single orphan commit, so history stays bounded). Consumers
-# (vig-os/devcontainer#870) then run
+# nvd.nist.gov is chronically throttled/unstable (vulnix#171). This repo is a
+# dedicated public mirror: this workflow is the only thing that talks to
+# nvd.nist.gov. Consumers (vig-os/devcontainer#870) run
 # `vulnix --mirror https://vig-os.github.io/nvd-mirror/` and never depend on
-# nvd.nist.gov at scan time. If a refresh fails, the last good gh-pages
-# deployment keeps serving.
+# nvd.nist.gov at scan time.
+#
+# It refreshes CONDITIONALLY (#1): the current feeds + their ETags are carried
+# forward from gh-pages, and each feed is fetched with If-None-Match. Only feeds
+# whose ETag changed re-download (`modified` most runs; the current year
+# occasionally; older years almost never) — the rest return 304 and are kept. It
+# force-pushes a single orphan gh-pages commit only when something changed, so
+# history stays bounded and NVD load stays minimal. If a refresh fails, the last
+# good gh-pages deployment keeps serving.
 name: Refresh NVD mirror
 
 on:  # yamllint disable-line rule:truthy
@@ -29,48 +32,75 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       NVD_FEED_BASE: https://nvd.nist.gov/feeds/json/cve/2.0
     steps:
-      - name: Download NVD 2.0 feeds (resumable, retrying)
-        # curl -C - resumes this run's own partial file across --retry attempts.
-        # set -e + `gzip -t` means a truncated/short download fails the job, so a
-        # broken/partial feed set is never published (gh-pages keeps the last
-        # good copy). vulnix fetches nvdcve-2.0-<name>.json.gz for a rolling
-        # 6-year window plus `modified`.
+      - name: Restore current mirror (gh-pages)
+        # gh-pages holds the served feeds plus a <feed>.etag sidecar for each.
+        # Pull them so we can do conditional GETs and carry unchanged feeds
+        # forward. First run (or no gh-pages yet): start empty -> full fetch.
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: Conditionally refresh feeds
+        # Only feeds whose ETag changed re-download (304 = keep cached copy).
+        # set -e + `gzip -t` means a corrupt 200 fails the job so a broken feed
+        # set is never published (gh-pages keeps last-good). Any code other than
+        # 200/304 (e.g. NVD 404 under load) fails the job too.
         run: |
           set -euo pipefail
           mkdir -p site
+          cd site
           names=(modified)
           year="$(date -u +%Y)"
           for y in $(seq "$((year - 5))" "$year"); do names+=("$y"); done
+          changed=0
           for n in "${names[@]}"; do
             f="nvdcve-2.0-${n}.json.gz"
-            echo "::group::fetch ${f}"
-            curl -fSL --retry 8 --retry-all-errors --retry-delay 15 \
-                 --retry-max-time 600 -C - -o "site/${f}" "${NVD_FEED_BASE}/${f}"
-            gzip -t "site/${f}"
+            etag="${f}.etag"
+            cmp=()
+            [ -s "$etag" ] && [ -f "$f" ] && cmp=(--etag-compare "$etag")
+            echo "::group::${f}"
+            code="$(curl -sSL --retry 6 --retry-all-errors --retry-delay 15 \
+                     --retry-max-time 600 "${cmp[@]}" --etag-save "${etag}.new" \
+                     -o "${f}.new" -w '%{http_code}' "${NVD_FEED_BASE}/${f}")"
+            case "$code" in
+              304) echo "304 not modified — keeping cached"; rm -f "${f}.new" "${etag}.new" ;;
+              200) gzip -t "${f}.new"; mv "${f}.new" "$f"; mv "${etag}.new" "$etag"
+                   changed=1; echo "200 updated ($(du -h "$f" | cut -f1))" ;;
+              *)   echo "::error::${f}: unexpected HTTP ${code}"; exit 1 ;;
+            esac
+            [ -f "$f" ] || { echo "::error::${f} missing after fetch"; exit 1; }
             echo "::endgroup::"
           done
-          touch site/.nojekyll
+          touch .nojekyll
           {
             echo '<!doctype html><meta charset="utf-8"><title>NVD 2.0 feed mirror</title>'
             echo '<h1>NVD 2.0 feed mirror</h1>'
             echo '<p>Mirror of the NVD JSON 2.0 data feeds for vulnix. See vig-os/devcontainer#870.</p><ul>'
-            for f in site/nvdcve-2.0-*.json.gz; do b="$(basename "$f")"; echo "<li><a href=\"${b}\">${b}</a></li>"; done
+            for x in nvdcve-2.0-*.json.gz; do echo "<li><a href=\"${x}\">${x}</a></li>"; done
             echo '</ul>'
-          } > site/index.html
-          ls -lh site
+          } > index.html
+          echo "changed=${changed}" >> "$GITHUB_ENV"
+          echo "Summary: changed=${changed}"
 
-      - name: Publish to gh-pages (orphan commit, force-pushed to bound history)
+      - name: Publish to gh-pages (only if changed)
+        if: env.changed == '1'
+        # git sends only changed blobs even though this force-pushes a fresh
+        # orphan commit (unchanged feeds keep the same blob SHA), so history
+        # stays a single bounded commit and the push stays small.
         run: |
           set -euo pipefail
           cd site
+          rm -rf .git
           git init -q
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git checkout -q --orphan gh-pages
           git add -A
           git commit -qm "Refresh NVD feed mirror ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
