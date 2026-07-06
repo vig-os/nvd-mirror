@@ -1,13 +1,17 @@
-# Refresh the NVD 2.0 feed mirror and publish it to GitHub Pages.
+# Refresh the NVD 2.0 feed mirror and publish it to the gh-pages branch
+# (served by GitHub Pages).
 #
 # vulnix (nix-community/vulnix) consumes the NVD 2.0 JSON data feeds, but
 # nvd.nist.gov is chronically throttled/unstable (vulnix#171): cold scans crawl
 # the full year-feed set for tens of minutes and fail with ReadTimeoutError /
-# IncompleteRead. This repo is a dedicated public mirror: this workflow is the
-# only thing that talks to nvd.nist.gov. It downloads the feed files with
-# resumable retry, validates them, and deploys them to GitHub Pages, so
-# consumers (vig-os/devcontainer#870) can `vulnix --mirror https://vig-os.github.io/nvd-mirror/`
-# and never depend on nvd.nist.gov at scan time.
+# IncompleteRead / intermittent 404s. This repo is a dedicated public mirror:
+# this workflow is the only thing that talks to nvd.nist.gov. It downloads the
+# feed files with resumable retry, validates them, and force-pushes them to the
+# gh-pages branch (single orphan commit, so history stays bounded). Consumers
+# (vig-os/devcontainer#870) then run
+# `vulnix --mirror https://vig-os.github.io/nvd-mirror/` and never depend on
+# nvd.nist.gov at scan time. If a refresh fails, the last good gh-pages
+# deployment keeps serving.
 name: Refresh NVD mirror
 
 on:  # yamllint disable-line rule:truthy
@@ -16,33 +20,28 @@ on:  # yamllint disable-line rule:truthy
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write   # force-push the gh-pages branch
 
 concurrency:
-  group: nvd-mirror-pages
+  group: nvd-mirror
   cancel-in-progress: false
 
 jobs:
   refresh:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     env:
       NVD_FEED_BASE: https://nvd.nist.gov/feeds/json/cve/2.0
     steps:
       - name: Download NVD 2.0 feeds (resumable, retrying)
         # curl -C - resumes this run's own partial file across --retry attempts.
-        # set -e + `gzip -t` means a truncated download fails the job, so a
-        # broken/partial feed set is never deployed (Pages keeps the last good
-        # deployment). vulnix fetches nvdcve-2.0-<name>.json.gz for a rolling
+        # set -e + `gzip -t` means a truncated/short download fails the job, so a
+        # broken/partial feed set is never published (gh-pages keeps the last
+        # good copy). vulnix fetches nvdcve-2.0-<name>.json.gz for a rolling
         # 6-year window plus `modified`.
         run: |
           set -euo pipefail
-          mkdir -p _site
+          mkdir -p site
           names=(modified)
           year="$(date -u +%Y)"
           for y in $(seq "$((year - 5))" "$year"); do names+=("$y"); done
@@ -50,28 +49,28 @@ jobs:
             f="nvdcve-2.0-${n}.json.gz"
             echo "::group::fetch ${f}"
             curl -fSL --retry 8 --retry-all-errors --retry-delay 15 \
-                 --retry-max-time 600 -C - -o "_site/${f}" "${NVD_FEED_BASE}/${f}"
-            gzip -t "_site/${f}"
+                 --retry-max-time 600 -C - -o "site/${f}" "${NVD_FEED_BASE}/${f}"
+            gzip -t "site/${f}"
             echo "::endgroup::"
           done
-          touch _site/.nojekyll
+          touch site/.nojekyll
           {
             echo '<!doctype html><meta charset="utf-8"><title>NVD 2.0 feed mirror</title>'
             echo '<h1>NVD 2.0 feed mirror</h1>'
             echo '<p>Mirror of the NVD JSON 2.0 data feeds for vulnix. See vig-os/devcontainer#870.</p><ul>'
-            for f in _site/nvdcve-2.0-*.json.gz; do b="$(basename "$f")"; echo "<li><a href=\"${b}\">${b}</a></li>"; done
+            for f in site/nvdcve-2.0-*.json.gz; do b="$(basename "$f")"; echo "<li><a href=\"${b}\">${b}</a></li>"; done
             echo '</ul>'
-          } > _site/index.html
-          ls -lh _site
+          } > site/index.html
+          ls -lh site
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-
-      - name: Deploy to Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
+      - name: Publish to gh-pages (orphan commit, force-pushed to bound history)
+        run: |
+          set -euo pipefail
+          cd site
+          git init -q
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git checkout -q --orphan gh-pages
+          git add -A
+          git commit -qm "Refresh NVD feed mirror ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
