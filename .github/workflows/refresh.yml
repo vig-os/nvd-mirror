@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       NVD_FEED_BASE: https://nvd.nist.gov/feeds/json/cve/2.0
