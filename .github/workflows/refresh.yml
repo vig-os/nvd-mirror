@@ -40,7 +40,7 @@ jobs:
         # gh-pages holds the served feeds plus a <feed>.etag sidecar for each.
         # Pull them so we can do conditional GETs and carry unchanged feeds
         # forward. First run (or no gh-pages yet): start empty -> full fetch.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         continue-on-error: true
         with:
           ref: gh-pages
